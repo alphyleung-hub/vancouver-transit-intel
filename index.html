@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vancouver Traffic & Transit Intelligence</title>
+  
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <!-- Google Fonts & Icons -->
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Inter', sans-serif; background: #0f172a; color: #f8fafc; overflow: hidden; }
+    
+    #map { width: 100vw; height: 100vh; z-index: 1; }
+
+    /* Floating UI Controls */
+    .glass-panel {
+      position: absolute;
+      background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px;
+      padding: 16px;
+      z-index: 1000;
+      box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+    }
+
+    #control-panel { top: 20px; left: 20px; width: 320px; }
+    #stats-panel { bottom: 20px; left: 20px; width: 320px; }
+
+    h1 { font-size: 1.1rem; font-weight: 700; color: #38bdf8; display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+    
+    .input-group { margin-bottom: 10px; }
+    .input-group label { display: block; font-size: 0.75rem; color: #94a3b8; margin-bottom: 4px; }
+    .input-group input, .input-group select {
+      width: 100%; padding: 8px 10px; background: #1e293b; border: 1px solid #334155;
+      border-radius: 6px; color: #fff; font-size: 0.85rem; outline: none;
+    }
+
+    .btn {
+      width: 100%; padding: 10px; background: #0284c7; border: none; border-radius: 6px;
+      color: white; font-weight: 600; font-size: 0.85rem; cursor: pointer; transition: all 0.2s;
+    }
+    .btn:hover { background: #0369a1; }
+
+    .stat-row { display: flex; justify-content: space-between; font-size: 0.85rem; padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+    .stat-label { color: #94a3b8; }
+    .stat-value { font-weight: 600; color: #38bdf8; }
+
+    /* Custom Leaflet Markers */
+    .bus-marker {
+      background: #0284c7; border: 2px solid #ffffff; border-radius: 50%;
+      width: 14px; height: 14px; box-shadow: 0 0 10px rgba(2, 132, 199, 0.8);
+    }
+    .skytrain-marker {
+      background: #e11d48; border: 2px solid #ffffff; border-radius: 50%;
+      width: 16px; height: 16px; box-shadow: 0 0 10px rgba(225, 29, 72, 0.8);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top Control Panel -->
+  <div id="control-panel" class="glass-panel">
+    <h1><i class="fa-solid fa-bus-simple"></i> VanTransit Intel</h1>
+    
+    <div class="input-group">
+      <label for="apiKey">TransLink API Key</label>
+      <input type="password" id="apiKey" placeholder="Enter API Key (Optional)">
+    </div>
+
+    <div class="input-group">
+      <label for="proxy">CORS Proxy</label>
+      <select id="proxy">
+        <option value="https://corsproxy.io/?">CorsProxy.io</option>
+        <option value="https://api.allorigins.win/raw?url=">AllOrigins Proxy</option>
+      </select>
+    </div>
+
+    <button class="btn" onclick="toggleMode()">Fetch Real-Time Data</button>
+  </div>
+
+  <!-- Bottom Analytics Panel -->
+  <div id="stats-panel" class="glass-panel">
+    <div class="stat-row">
+      <span class="stat-label">Active Buses</span>
+      <span class="stat-value" id="bus-count">--</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Active SkyTrains</span>
+      <span class="stat-value" id="train-count">--</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Status Mode</span>
+      <span class="stat-value" id="mode-status" style="color: #f59e0b;">Simulation Engine</span>
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+  <!-- External Libraries -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/protobufjs@7.X.X/dist/protobuf.min.js"></script>
+
+  <script>
+    // 1. Initialize Leaflet Map centered on Greater Vancouver
+    const map = L.map('map').setView([49.2827, -123.1207], 12);
+
+    // Add Dark Matter Tile Layer from CartoDB
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>',
+      subdomains: 'abcd',
+      maxZoom: 19
+    }).addTo(map);
+
+    let vehicleLayer = L.layerGroup().addTo(map);
+    let simulatedVehicles = [];
+
+    // 2. Simulated Fleet Generator for initial state (fallback mode)
+    function generateSimulatedData() {
+      const routes = [
+        { name: "99 B-Line", coords: [[49.2635, -123.1153], [49.2660, -123.2460]], type: "bus" },
+        { name: "R4 41st Ave", coords: [[49.2343, -123.0333], [49.2355, -123.2467]], type: "bus" },
+        { name: "Expo Line", coords: [[49.2858, -123.1118], [49.2000, -122.9126]], type: "train" },
+        { name: "Canada Line", coords: [[49.2858, -123.1118], [49.1950, -123.1360]], type: "train" }
+      ];
+
+      simulatedVehicles = [];
+      routes.forEach((route, i) => {
+        for (let j = 0; j < 5; j++) {
+          const progress = (Math.random());
+          const lat = route.coords[0][0] + progress * (route.coords[1][0] - route.coords[0][0]);
+          const lng = route.coords[0][1] + progress * (route.coords[1][1] - route.coords[0][1]);
+          simulatedVehicles.push({
+            id: `${route.type.toUpperCase()}-${i}-${j}`,
+            route: route.name,
+            lat: lat,
+            lng: lng,
+            type: route.type
+          });
+        }
+      });
+      renderVehicles(simulatedVehicles);
+    }
+
+    // 3. Render Markers on Map
+    function renderVehicles(vehicles) {
+      vehicleLayer.clearLayers();
+      let busCount = 0;
+      let trainCount = 0;
+
+      vehicles.forEach(v => {
+        const className = v.type === 'bus' ? 'bus-marker' : 'skytrain-marker';
+        const icon = L.divIcon({ className: className, iconSize: [14, 14] });
+
+        L.marker([v.lat, v.lng], { icon: icon })
+         .bindPopup(`<b>Route:</b> ${v.route}<br><b>Vehicle ID:</b> ${v.id}<br><b>Type:</b> ${v.type.toUpperCase()}`)
+         .addTo(vehicleLayer);
+
+        if (v.type === 'bus') busCount++; else trainCount++;
+      });
+
+      document.getElementById('bus-count').innerText = busCount;
+      document.getElementById('train-count').innerText = trainCount;
+    }
+
+    // 4. Fetch Real-time GTFS-RT Data from TransLink
+    async function fetchTransLinkRealtime() {
+      const apiKey = document.getElementById('apiKey').value.trim();
+      const proxy = document.getElementById('proxy').value;
+
+      if (!apiKey) {
+        alert("Please enter a valid TransLink API Key to enable live tracking.");
+        return;
+      }
+
+      // TransLink GTFS-Realtime Endpoint
+      const targetUrl = `https://gtfsapi.translink.ca/v3/gtfsposition?apikey=${apiKey}`;
+      const requestUrl = proxy + encodeURIComponent(targetUrl);
+
+      try {
+        const response = await fetch(requestUrl);
+        if (!response.ok) throw new Error("HTTP error " + response.status);
+
+        // Process GTFS-RT binary response
+        document.getElementById('mode-status').innerText = "Live API Connected";
+        document.getElementById('mode-status').style.color = "#10b981";
+
+        // Real API data processing logic...
+      } catch (err) {
+        console.error("TransLink Fetch Error:", err);
+        alert("Failed to connect to live API feed. Check key or proxy connection.");
+      }
+    }
+
+    function toggleMode() {
+      fetchTransLinkRealtime();
+    }
+
+    // Initialize Simulation Mode on Load
+    generateSimulatedData();
+    setInterval(() => {
+      // Simulate minor vehicle location drift
+      simulatedVehicles.forEach(v => {
+        v.lat += (Math.random() - 0.5) * 0.001;
+        v.lng += (Math.random() - 0.5) * 0.001;
+      });
+      if (document.getElementById('mode-status').innerText.includes("Simulation")) {
+        renderVehicles(simulatedVehicles);
+      }
+    }, 3000);
+  </script>
+</body>
+</html>
