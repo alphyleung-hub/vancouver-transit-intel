@@ -1,224 +1,88 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Vancouver Traffic & Transit Intelligence</title>
+<!-- Include Protobuf.js CDN in <head> -->
+<script src="https://cdn.jsdelivr.net/npm/protobufjs@7.2.5/dist/protobuf.min.js"></script>
 
-  <!-- Google Fonts & Icons -->
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet" />
+<script>
+// Official GTFS-Realtime Minimal Proto Schema
+const gtfsProtoSchema = `
+syntax = "proto2";
+package transit_realtime;
 
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body, html { width: 100%; height: 100%; font-family: 'Inter', sans-serif; background: #0f172a; overflow: hidden; }
+message FeedMessage {
+  required FeedHeader header = 1;
+  repeated FeedEntity entity = 2;
+}
 
-    /* Map container */
-    #map {
-      width: 100vw;
-      height: 100vh;
-      position: absolute;
-      top: 0;
-      left: 0;
-      z-index: 1;
-    }
+message FeedHeader {
+  required string gtfs_realtime_version = 1;
+}
 
-    /* Floating UI Control Panels */
-    .glass-panel {
-      position: absolute;
-      background: rgba(15, 23, 42, 0.90);
-      backdrop-filter: blur(12px);
-      border: 1px solid rgba(255, 255, 255, 0.15);
-      border-radius: 12px;
-      padding: 16px;
-      z-index: 1000;
-      color: #f8fafc;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.6);
-    }
+message FeedEntity {
+  required string id = 1;
+  optional VehiclePosition vehicle = 4;
+}
 
-    #control-panel { top: 20px; left: 20px; width: 330px; }
-    #stats-panel { bottom: 20px; left: 20px; width: 330px; }
+message VehiclePosition {
+  optional Position position = 2;
+  optional TripDescriptor trip = 1;
+}
 
-    h2 { font-size: 1rem; color: #38bdf8; display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+message Position {
+  optional float latitude = 1;
+  optional float longitude = 2;
+  optional float bearing = 3;
+}
+
+message TripDescriptor {
+  optional string route_id = 5;
+}
+`;
+
+async function fetchLiveTransLink(apiKey) {
+  try {
+    // 1. Build request with binary arrayBuffer return
+    const targetUrl = `https://gtfsapi.translink.ca/v3/gtfsposition?apikey=${apiKey}`;
     
-    .field { margin-bottom: 10px; }
-    .field label { display: block; font-size: 0.75rem; color: #94a3b8; margin-bottom: 4px; }
-    .field input {
-      width: 100%; padding: 8px 10px; background: #1e293b; border: 1px solid #334155;
-      border-radius: 6px; color: #fff; font-size: 0.85rem; outline: none;
-    }
+    // Use raw binary handling proxy (AllOrigins or custom proxy headers)
+    const proxyUrl = `https://api.allorigins.win/raw?url=` + encodeURIComponent(targetUrl);
 
-    .btn {
-      width: 100%; padding: 10px; background: #0284c7; border: none; border-radius: 6px;
-      color: white; font-weight: 600; font-size: 0.85rem; cursor: pointer; transition: 0.2s;
-    }
-    .btn:hover { background: #0369a1; }
+    const response = await fetch(proxyUrl);
+    if (!response.ok) throw new Error("HTTP error: " + response.status);
 
-    .stat-row { display: flex; justify-content: space-between; font-size: 0.85rem; padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
-    .stat-label { color: #94a3b8; }
-    .stat-val { font-weight: 600; color: #38bdf8; }
-  </style>
-</head>
-<body>
+    // CRITICAL: Fetch as ArrayBuffer (binary), NEVER as JSON/Text
+    const buffer = await response.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
 
-  <!-- Controls Panel -->
-  <div id="control-panel" class="glass-panel">
-    <h2><i class="fa-solid fa-map-location-dot"></i> Vancouver Transit Intel</h2>
+    // 2. Parse schema in browser
+    const root = protobuf.parse(gtfsProtoSchema).root;
+    const FeedMessage = root.lookupType("transit_realtime.FeedMessage");
     
-    <div class="field">
-      <label>Google Maps API Key (Free Tier)</label>
-      <input type="password" id="gKey" placeholder="Paste Google Maps API Key">
-    </div>
+    // 3. Decode binary payload
+    const message = FeedMessage.decode(bytes);
+    const feed = FeedMessage.toObject(message, { enums: String, longs: String });
 
-    <button class="btn" onclick="initMapWithKey()"><i class="fa-solid fa-play"></i> Launch Google Map</button>
-  </div>
+    console.log("Decoded Vehicles:", feed.entity);
 
-  <!-- Telemetry Panel -->
-  <div id="stats-panel" class="glass-panel">
-    <div class="stat-row">
-      <span class="stat-label">Active Transit Units</span>
-      <span class="stat-val" id="unit-count">0</span>
-    </div>
-    <div class="stat-row">
-      <span class="stat-label">Map Engine</span>
-      <span class="stat-val" id="mode-status" style="color: #38bdf8;">Ready for Key</span>
-    </div>
-  </div>
-
-  <!-- Google Map Dom Target -->
-  <div id="map"></div>
-
-  <!-- Load Google Maps JavaScript SDK dynamically -->
-  <script>
-    let map;
-    let markers = [];
-    let activeFleet = [];
-
-    function loadScript(apiKey) {
-      if (!apiKey) {
-        alert("Please enter a Google Maps API Key.");
-        return;
-      }
-      
-      // Remove existing script if any
-      const existingScript = document.getElementById('gmaps-sdk');
-      if (existingScript) existingScript.remove();
-
-      const script = document.createElement('script');
-      script.id = 'gmaps-sdk';
-      script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&callback=initGoogleMap`;
-      script.async = true;
-      script.defer = true;
-      
-      script.onerror = () => {
-        alert("Failed to load Google Maps script. Check your API key restrictions.");
-      };
-      
-      document.head.appendChild(script);
-    }
-
-    function initMapWithKey() {
-      const key = document.getElementById('gKey').value.trim();
-      loadScript(key);
-    }
-
-    function initGoogleMap() {
-      const vancouverCenter = { lat: 49.2827, lng: -123.1207 };
-
-      // Dark theme custom map styling optimized for transit dashboards
-      const darkMapStyle = [
-        { elementType: "geometry", stylers: [{ color: "#1d2c4d" }] },
-        { elementType: "labels.text.fill", stylers: [{ color: "#8ec3b9" }] },
-        { elementType: "labels.text.stroke", stylers: [{ color: "#1a3646" }] },
-        { featureType: "road", elementType: "geometry", stylers: [{ color: "#304a7d" }] },
-        { featureType: "water", elementType: "geometry", stylers: [{ color: "#0e1626" }] }
-      ];
-
-      map = new google.maps.Map(document.getElementById("map"), {
-        zoom: 12,
-        center: vancouverCenter,
-        styles: darkMapStyle,
-        disableDefaultUI: false,
-        zoomControl: true,
-        zoomControlOptions: { position: google.maps.ControlPosition.RIGHT_TOP }
-      });
-
-      document.getElementById('mode-status').innerText = "Google Maps Active";
-      document.getElementById('mode-status').style.color = "#10b981";
-
-      generateFleet();
-    }
-
-    function generateFleet() {
-      const corridors = [
-        { name: "99 B-Line Express", start: [49.2635, -123.1153], end: [49.2660, -123.2460], type: "bus", count: 8 },
-        { name: "R4 41st Ave RapidBus", start: [49.2343, -123.0333], end: [49.2355, -123.2467], type: "bus", count: 6 },
-        { name: "Expo Line SkyTrain", start: [49.2858, -123.1118], end: [49.2000, -122.9126], type: "train", count: 10 },
-        { name: "Canada Line SkyTrain", start: [49.2858, -123.1118], end: [49.1950, -123.1360], type: "train", count: 7 }
-      ];
-
-      activeFleet = [];
-      corridors.forEach((c, idx) => {
-        for (let i = 0; i < c.count; i++) {
-          const ratio = Math.random();
-          activeFleet.push({
-            id: `${c.type.toUpperCase()}-${idx}${i}`,
-            route: c.name,
-            lat: c.start[0] + ratio * (c.end[0] - c.start[0]),
-            lng: c.start[1] + ratio * (c.end[1] - c.start[1]),
-            type: c.type
+    // 4. Extract vehicle markers for Leaflet Map
+    const vehicles = [];
+    if (feed.entity) {
+      feed.entity.forEach(item => {
+        if (item.vehicle && item.vehicle.position) {
+          vehicles.push({
+            id: item.id,
+            route: item.vehicle.trip ? item.vehicle.trip.routeId : 'Bus',
+            lat: item.vehicle.position.latitude,
+            lng: item.vehicle.position.longitude,
+            type: 'bus'
           });
         }
       });
-
-      renderGoogleMarkers();
-
-      // Live vehicle motion loop
-      setInterval(() => {
-        if (!map) return;
-        activeFleet.forEach(v => {
-          v.lat += (Math.random() - 0.49) * 0.0005;
-          v.lng += (Math.random() - 0.49) * 0.0005;
-        });
-        renderGoogleMarkers();
-      }, 2500);
     }
 
-    function renderGoogleMarkers() {
-      // Clear old markers
-      markers.forEach(m => m.setMap(null));
-      markers = [];
+    // Render vehicles on Leaflet
+    renderVehiclesToMap(vehicles);
 
-      activeFleet.forEach(v => {
-        const pinColor = v.type === 'bus' ? '#0284c7' : '#e11d48';
-
-        const marker = new google.maps.Marker({
-          position: { lat: v.lat, lng: v.lng },
-          map: map,
-          title: `${v.route} (${v.id})`,
-          icon: {
-            path: google.maps.SymbolPath.CIRCLE,
-            scale: 7,
-            fillColor: pinColor,
-            fillOpacity: 1,
-            strokeColor: '#ffffff',
-            strokeWeight: 2
-          }
-        });
-
-        const infowindow = new google.maps.InfoWindow({
-          content: `<div style="color:#000; font-family:Inter,sans-serif;"><b>Route:</b> ${v.route}<br><b>Unit:</b> ${v.id}<br><b>Status:</b> On Schedule</div>`
-        });
-
-        marker.addListener("click", () => {
-          infowindow.open(map, marker);
-        });
-
-        markers.push(marker);
-      });
-
-      document.getElementById('unit-count').innerText = activeFleet.length;
-    }
-  </script>
-</body>
-</html>
+  } catch (err) {
+    console.error("Browser Protobuf Parsing Error:", err);
+  }
+}
+</script>
